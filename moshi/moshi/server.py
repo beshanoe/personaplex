@@ -96,7 +96,8 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False,
+                 ):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -128,8 +129,10 @@ class ServerState:
                 _ = self.mimi.decode(tokens[:, 1:9])
                 _ = self.other_mimi.decode(tokens[:, 1:9])
 
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
+        # Synchronize all CUDA devices (important for multi-GPU setups)
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(torch.device(f'cuda:{i}'))
 
 
     async def handle_chat(self, request):
@@ -216,20 +219,33 @@ class ServerState:
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
-                    be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
+
+                    t0 = time.time()
                     codes = self.mimi.encode(chunk)
                     _ = self.other_mimi.encode(chunk)
+                    encode_time = time.time() - t0
+
                     for c in range(codes.shape[-1]):
+                        step_start = time.time()
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        lm_time = time.time() - step_start
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+
+                        t2 = time.time()
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
                         _ = self.other_mimi.decode(tokens[:, 1:9])
+                        decode_time = time.time() - t2
+
+                        step_total = time.time() - step_start
+                        if step_total > 0.08:  # Exceeded 80ms budget
+                            clog.log("warning", f"Step exceeded budget: total={step_total*1000:.1f}ms "
+                                     f"(encode={encode_time*1000:.1f}, lm={lm_time*1000:.1f}, decode={decode_time*1000:.1f})")
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
@@ -373,6 +389,19 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
+    parser.add_argument("--multi-gpu", action="store_true",
+                        help="Distribute model layers across all available GPUs (layer-sharded parallelism). "
+                             "Requires at least 2 GPUs.")
+    parser.add_argument("--gpus", type=int, default=None,
+                        help="Limit the number of GPUs to use when --multi-gpu is enabled.")
+    parser.add_argument("--depformer-cost-ratio", type=float, default=0.5,
+                        help="How much depformer work counts relative to a transformer layer "
+                             "when balancing the layer split across GPUs. "
+                             "0.0 = even split, 0.5 = default, 1.0 = aggressive. "
+                             "Only used with --multi-gpu.")
+    parser.add_argument("--timing", action="store_true",
+                        help="Enable per-GPU timing metrics logging (every 100 frames). "
+                             "Only used with --multi-gpu.")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -442,7 +471,12 @@ def main():
     logger.info("loading moshi")
     if args.moshi_weight is None:
         args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
-    lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
+    lm = loaders.get_moshi_lm(
+        args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload,
+        multi_gpu=args.multi_gpu, gpus=args.gpus,
+        depformer_cost_ratio=args.depformer_cost_ratio,
+        timing_enabled=args.timing,
+    )
     lm.eval()
     logger.info("moshi loaded")
     state = ServerState(

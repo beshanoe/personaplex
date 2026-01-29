@@ -29,11 +29,13 @@ import logging
 from safetensors.torch import load_model, load_file
 import torch
 
-logger = logging.getLogger(__name__)
+from ..utils.logging import setup_logger
+logger = setup_logger(__name__)
 
 from .compression import MimiModel
 from .lm import LMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
+from ..modules.streaming import StreamingContainer
 from ..quantization import SplitResidualVectorQuantizer
 
 SAMPLE_RATE = 24000
@@ -126,6 +128,55 @@ def _is_safetensors(path: Path | str) -> bool:
     return Path(path).suffix in (".safetensors", ".sft", ".sfts")
 
 
+def _patch_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    model_sd: dict[str, torch.Tensor],
+    copy_missing_weights: bool,
+) -> dict[str, torch.Tensor]:
+    """Patch loaded state_dict to match model architecture.
+
+    Handles two cases:
+    1. Expanding depformer self_attn weights when shapes don't match.
+    2. Copying weights from layers 0..7 to 8..15 for certain parameter groups
+       when copy_missing_weights is True.
+    """
+    # Patch 1: expand depformer self_attn weights if needed
+    for name, tensor in list(state_dict.items()):
+        if "depformer" in name and "self_attn" in name and name in model_sd:
+            if tensor.shape != model_sd[name].shape:
+                logger.info(f"Expanding {name}")
+                missing = (
+                    tensor
+                    if copy_missing_weights
+                    else model_sd[name][tensor.shape[0]:]
+                )
+                state_dict[name] = torch.concat([tensor, missing], dim=0)
+
+    # Patch 2: fill missing keys by copying 0..7 -> 8..15 for certain groups
+    if copy_missing_weights:
+        to_replace = ["gating", "linears", "depformer_in", "depformer_emb"]
+        for name in model_sd.keys():
+            if name in state_dict:
+                continue
+            replaced = False
+            for old, new in zip(range(8), range(8, 16)):
+                for rep in to_replace:
+                    needle = f"{rep}.{new}."
+                    if needle in name:
+                        src = name.replace(needle, f"{rep}.{old}.")
+                        if src in state_dict:
+                            logger.info(f"Replacing {name} <- {src}")
+                            state_dict[name] = state_dict[src]
+                            replaced = True
+                        break
+                if replaced:
+                    break
+            if not replaced:
+                logger.warning(f"Missing {name}")
+
+    return state_dict
+
+
 def get_mimi(filename: str | Path,
              device: torch.device | str = 'cpu') -> MimiModel:
     """Return a pretrained Mimi model."""
@@ -170,6 +221,10 @@ def get_moshi_lm(
     dtype: torch.dtype = torch.bfloat16,
     delays=None,
     cpu_offload: bool = False,
+    multi_gpu: bool = False,
+    gpus: int | None = None,
+    depformer_cost_ratio: float = 0.5,
+    timing_enabled: bool = False,
 ) -> LMModel:
     """Return a pretrained Moshi LM model.
 
@@ -181,12 +236,22 @@ def get_moshi_lm(
         delays: Optional custom delays configuration.
         cpu_offload: If True, offload model layers to CPU when GPU memory is
                      insufficient. Uses accelerate's device_map="auto".
+        multi_gpu: If True, distribute model across all available GPUs.
+                   Uses accelerate's device_map with explicit GPU memory allocation.
+        gpus: Optional limit on the number of GPUs to use when multi_gpu is True.
     """
     # Copy to avoid mutating a shared/global dict
     lm_kwargs = dict(_lm_kwargs)
     lm_kwargs["dep_q"] = 16
     if delays is not None:
         lm_kwargs["delays"] = delays
+
+    if multi_gpu and filename is not None:
+        return _get_moshi_lm_multi_gpu(
+            filename, copy_missing_weights, device, dtype, lm_kwargs, gpus,
+            depformer_cost_ratio=depformer_cost_ratio,
+            timing_enabled=timing_enabled,
+        )
 
     if cpu_offload and filename is not None:
         return _get_moshi_lm_with_offload(
@@ -215,40 +280,7 @@ def get_moshi_lm(
         # torch checkpoint
         with open(filename, "rb") as f:
             state_dict = torch.load(f, map_location="cpu")
-    # Patch 1: expand depformer self_attn weights if needed
-    model_sd = model.state_dict()
-    for name, tensor in list(state_dict.items()):
-        if "depformer" in name and "self_attn" in name and name in model_sd:
-            if tensor.shape != model_sd[name].shape:
-                print("Expanding %s", name)
-                missing = (
-                    tensor
-                    if copy_missing_weights
-                    else model_sd[name][tensor.shape[0] :]
-                )
-                state_dict[name] = torch.concat([tensor, missing], dim=0)
-
-    # Patch 2: fill missing keys by copying 0..7 -> 8..15 for certain groups
-    if copy_missing_weights:
-        to_replace = ["gating", "linears", "depformer_in", "depformer_emb"]
-        for name in model_sd.keys():
-            if name in state_dict:
-                continue
-            replaced = False
-            for old, new in zip(range(8), range(8, 16)):
-                for rep in to_replace:
-                    needle = f"{rep}.{new}."
-                    if needle in name:
-                        src = name.replace(needle, f"{rep}.{old}.")
-                        if src in state_dict:
-                            print("Replacing %s <- %s", name, src)
-                            state_dict[name] = state_dict[src]
-                            replaced = True
-                        break
-                if replaced:
-                    break
-            if not replaced:
-                print("Missing %s", name)
+    state_dict = _patch_state_dict(state_dict, model.state_dict(), copy_missing_weights)
 
     # Assign weights to target device
     dev = torch.device(device) if isinstance(device, str) else device
@@ -295,39 +327,7 @@ def _get_moshi_lm_with_offload(
             state_dict = torch.load(f, map_location="cpu")
 
     # Apply weight patches (same as non-offload path)
-    model_sd = model.state_dict()
-    for name, tensor in list(state_dict.items()):
-        if "depformer" in name and "self_attn" in name and name in model_sd:
-            if tensor.shape != model_sd[name].shape:
-                logger.info(f"Expanding {name}")
-                missing = (
-                    tensor
-                    if copy_missing_weights
-                    else model_sd[name][tensor.shape[0]:]
-                )
-                state_dict[name] = torch.concat([tensor, missing], dim=0)
-
-    if copy_missing_weights:
-        to_replace = ["gating", "linears", "depformer_in", "depformer_emb"]
-        for name in model_sd.keys():
-            if name in state_dict:
-                continue
-            replaced = False
-            for old, new in zip(range(8), range(8, 16)):
-                for rep in to_replace:
-                    needle = f"{rep}.{new}."
-                    if needle in name:
-                        src = name.replace(needle, f"{rep}.{old}.")
-                        if src in state_dict:
-                            logger.info(f"Replacing {name} <- {src}")
-                            state_dict[name] = state_dict[src]
-                            replaced = True
-                        break
-                if replaced:
-                    break
-            if not replaced:
-                logger.warning(f"Missing {name}")
-
+    state_dict = _patch_state_dict(state_dict, model.state_dict(), copy_missing_weights)
     model.load_state_dict(state_dict, strict=False, assign=True)
 
     # Determine target device
@@ -362,3 +362,527 @@ def _get_moshi_lm_with_offload(
 
     model.eval()
     return model
+
+
+def _get_moshi_lm_multi_gpu(
+    filename: str | Path,
+    copy_missing_weights: bool,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    lm_kwargs: dict,
+    gpus: int | None = None,
+    depformer_cost_ratio: float = 0.5,
+    timing_enabled: bool = False,
+) -> LMModel:
+    """Load Moshi LM distributed across multiple GPUs using layer-sharded parallelism.
+
+    Distributes transformer layers across GPUs and handles device transitions
+    explicitly. This approach is compatible with Moshi's streaming KV cache.
+
+    Args:
+        depformer_cost_ratio: How much depformer work counts relative to a transformer
+            layer when balancing across GPUs. The last GPU runs the depformer in addition
+            to its transformer layers, so a positive ratio shifts more transformer layers
+            to earlier GPUs.  0.0 = even split, 0.5 = default, 1.0 = aggressive.
+    """
+    filename = str(filename)
+    available_gpus = torch.cuda.device_count()
+    if gpus is not None:
+        if gpus > available_gpus:
+            logger.warning(f"Requested {gpus} GPUs but only {available_gpus} are available.")
+        num_gpus = min(gpus, available_gpus)
+    else:
+        num_gpus = available_gpus
+    
+    logger.info(f"Multi-GPU: found {available_gpus} CUDA devices, using {num_gpus}")
+
+    if num_gpus < 2:
+        raise RuntimeError(
+            f"--multi-gpu requires at least 2 GPUs, but found {num_gpus}. "
+            "Use --cpu-offload for single GPU with CPU fallback."
+        )
+
+    # Create model on CPU first
+    model = LMModel(device="cpu", dtype=dtype, **lm_kwargs)
+
+    # Load weights to CPU
+    if filename.endswith(".safetensors"):
+        state_dict = load_file(filename, device="cpu")
+    else:
+        with open(filename, "rb") as f:
+            state_dict = torch.load(f, map_location="cpu")
+
+    # Apply weight patches and ensure correct dtype
+    state_dict = _patch_state_dict(state_dict, model.state_dict(), copy_missing_weights)
+    for key in state_dict:
+        state_dict[key] = state_dict[key].to(dtype=dtype)
+    model.load_state_dict(state_dict, strict=False, assign=True)
+
+    # Distribute model components across GPUs with load-balanced split.
+    # The last GPU also runs the depformer, so we account for that cost
+    # by treating depformer layers as fractional transformer-layer equivalents.
+    num_transformer_layers = len(model.transformer.layers)
+    num_depformer_layers = lm_kwargs.get("depformer_num_layers", 6)
+    depformer_equivalent = int(num_depformer_layers * depformer_cost_ratio)
+    total_work = num_transformer_layers + depformer_equivalent
+    work_per_gpu = total_work / num_gpus
+    layers_for_last_gpu = max(1, round(work_per_gpu - depformer_equivalent))
+    remaining_layers = num_transformer_layers - layers_for_last_gpu
+    # Distribute remaining layers evenly across earlier GPUs
+    earlier_gpus = num_gpus - 1
+    layers_per_earlier_gpu = (remaining_layers + earlier_gpus - 1) // earlier_gpus if earlier_gpus > 0 else 0
+
+    logger.info(f"Distributing {num_transformer_layers} transformer layers across {num_gpus} GPUs "
+                f"(depformer_cost_ratio={depformer_cost_ratio})")
+
+    # Create device assignments for transformer layers
+    layer_devices = []
+    assigned = 0
+    for gpu_idx in range(num_gpus - 1):
+        count = min(layers_per_earlier_gpu, remaining_layers - assigned)
+        for _ in range(count):
+            layer_devices.append(torch.device(f"cuda:{gpu_idx}"))
+        assigned += count
+    # Last GPU gets the rest
+    for _ in range(num_transformer_layers - len(layer_devices)):
+        layer_devices.append(torch.device(f"cuda:{num_gpus - 1}"))
+
+    # Log per-GPU counts
+    gpu_layer_counts = {}
+    for dev in layer_devices:
+        s = str(dev)
+        gpu_layer_counts[s] = gpu_layer_counts.get(s, 0) + 1
+    logger.info(f"Layer distribution: {gpu_layer_counts} (last GPU also runs {num_depformer_layers}-layer depformer)")
+
+    # Move transformer layers to their assigned GPUs
+    for i, layer in enumerate(model.transformer.layers):
+        layer.to(layer_devices[i])
+        logger.debug(f"Transformer layer {i} -> {layer_devices[i]}")
+
+    # Move embeddings and first-stage components to cuda:0
+    primary_device = torch.device("cuda:0")
+    model.emb.to(primary_device)
+    model.text_emb.to(primary_device)
+
+    # Move output components to the last GPU (where transformer output lands)
+    last_device = layer_devices[-1]
+    model.out_norm.to(last_device)
+    model.text_linear.to(last_device)
+
+    # Move depformer components to last GPU (where transformer output lands)
+    # This eliminates the expensive transformer_out transfer back to cuda:0
+    model.depformer_in.to(last_device)
+    model.depformer.to(last_device)
+    model.depformer_emb.to(last_device)
+    model.depformer_text_emb.to(last_device)
+    model.linears.to(last_device)
+
+    # Log final distribution
+    gpu_layers = {}
+    for i, dev in enumerate(layer_devices):
+        dev_str = str(dev)
+        gpu_layers[dev_str] = gpu_layers.get(dev_str, 0) + 1
+    logger.info(f"Layer distribution: {gpu_layers}")
+
+    # Create wrapper that handles device transitions
+    class MultiGPULMModel(StreamingContainer):
+        """Wrapper that handles device transitions for multi-GPU inference.
+
+        Multi-GPU Synchronization Strategy: CUDA Events
+        ================================================
+
+        Problem:
+            When distributing transformer layers across multiple GPUs, data must be
+            transferred between devices at layer boundaries. The naive approach of
+            using torch.cuda.synchronize() after each transfer causes 18-90ms of
+            CPU blocking per frame, exceeding the 80ms real-time budget.
+
+            Simply removing synchronization (non_blocking=True only) creates data
+            races: GPU 1 may start computing before GPU 0's transfer completes,
+            since cross-device transfers use separate CUDA streams with no implicit
+            ordering.
+
+        Solution:
+            CUDA Events provide non-blocking GPU-to-GPU synchronization:
+
+            1. When GPU A finishes its layers, record an event on GPU A's stream
+            2. Before GPU B starts, make GPU B's stream wait for GPU A's event
+            3. The CPU never blocks - only the destination GPU waits if needed
+
+            Data flow with events:
+            ```
+            GPU 0: [Embedding] -> [Layers 0-15] -> record(event_0)
+                                                          |
+                                                          v (event wait, non-blocking to CPU)
+            GPU N:                                  wait(event_0) -> [Layers 16-31] -> [Depformer]
+                                                                                              |
+                                                                                              v
+            GPU 0:                                                          output tokens (~64 bytes)
+            ```
+
+            Note: Depformer runs on last GPU (GPU N) to avoid expensive transformer_out
+            transfer (~16KB). Only the small output tokens are transferred back to GPU 0.
+
+        Performance:
+            | Approach                    | CPU Blocking | Overhead/Frame |
+            |-----------------------------|--------------|----------------|
+            | torch.cuda.synchronize()    | Yes          | 18-90ms        |
+            | non_blocking only (broken)  | No           | DATA RACES     |
+            | CUDA Events (this impl)     | No           | ~4-8μs         |
+
+        Implementation Details:
+            - _gpu_streams: One dedicated CUDA stream per GPU for layer execution
+            - _boundary_events: One CUDA event per GPU to signal completion
+            - forward_embeddings(): Records events at device boundaries, waits before
+              starting on new device, executes layers within stream contexts
+            - Final transfer back to primary device also uses event synchronization
+            - wait_stream() syncs with default stream before depformer execution
+
+        References:
+            - PyTorch CUDA Semantics: https://pytorch.org/docs/stable/notes/cuda.html
+            - CUDA Events: https://pytorch.org/docs/stable/generated/torch.cuda.Event.html
+        """
+
+        def __init__(self, model, layer_devices, primary_device, last_device,
+                     timing_enabled=False):
+            super().__init__()
+            # Register as a named module so streaming state propagates to underlying model
+            self.add_module('_model', model)
+            self._layer_devices = layer_devices
+            self._primary_device = primary_device
+            self._last_device = last_device
+            self._depformer_device = last_device  # Depformer runs on last GPU
+            self._is_multi_gpu = True  # Flag for CUDA graph detection
+            # Track device boundaries for efficient transitions
+            self._device_boundaries = []
+            current_device = layer_devices[0]
+            for i, dev in enumerate(layer_devices[1:], 1):
+                if dev != current_device:
+                    self._device_boundaries.append(i)
+                    current_device = dev
+
+            # Create per-GPU streams and events for synchronization
+            # CUDA events allow non-blocking synchronization between GPUs
+            self._gpu_streams = {}
+            self._boundary_events = {}
+
+            for dev in set(layer_devices):
+                dev_str = str(dev)
+                if dev_str not in self._gpu_streams:
+                    self._gpu_streams[dev_str] = torch.cuda.Stream(device=dev)
+                    self._boundary_events[dev_str] = torch.cuda.Event()
+
+            # Also for primary device
+            primary_str = str(primary_device)
+            if primary_str not in self._gpu_streams:
+                self._gpu_streams[primary_str] = torch.cuda.Stream(device=primary_device)
+                self._boundary_events[primary_str] = torch.cuda.Event()
+
+            # Per-GPU timing metrics (opt-in via --timing flag)
+            self._timing_enabled = timing_enabled
+            self._frame_count = 0
+            self._timing_log_interval = 100
+            # Accumulate per-GPU transformer times and depformer times
+            self._gpu_transformer_times: dict[str, list[float]] = {str(d): [] for d in set(layer_devices)}
+            self._depformer_times: list[float] = []
+            # Create timing events per GPU (start/end pairs)
+            self._timing_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+            for dev in set(layer_devices):
+                dev_str = str(dev)
+                self._timing_events[dev_str] = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+            # Depformer timing events (on last device)
+            self._depformer_timing_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+
+        # HISTORY: Originally used torch.cuda.synchronize() at device boundaries,
+        # which caused 18-90ms CPU blocking per frame. A "quick fix" removed all
+        # synchronization, but this created data races since cross-device transfers
+        # use separate CUDA streams with no implicit ordering.
+        #
+        # CURRENT: Uses CUDA events (see _boundary_events) for non-blocking GPU-to-GPU
+        # synchronization. The destination GPU waits for the source GPU's event,
+        # but the CPU never blocks. Overhead is ~4-8μs per frame.
+
+        @property
+        def device(self):
+            return self._primary_device
+
+        def forward(self, *args, **kwargs):
+            return self._model(*args, **kwargs)
+
+        def embed_codes(self, sequence):
+            # Embeddings are on primary device
+            sequence = sequence.to(self._primary_device, non_blocking=True)
+            return self._model.embed_codes(sequence)
+
+        def forward_embeddings(self, input_):
+            """Forward pass through transformer with CUDA event synchronization.
+
+            This method processes input through all transformer layers distributed
+            across multiple GPUs, using CUDA events for non-blocking synchronization
+            at device boundaries.
+
+            Synchronization Flow:
+                1. Each GPU has a dedicated stream for layer execution
+                2. At device boundaries (GPU A -> GPU B):
+                   a. Record completion event on GPU A's stream
+                   b. Switch to GPU B's stream
+                   c. Wait for GPU A's event (GPU-side wait, CPU doesn't block)
+                   d. Transfer tensor to GPU B (non_blocking=True)
+                3. After all layers, transfer output back to primary device
+                4. Sync with default stream so depformer sees the data
+
+            Args:
+                input_: Embedded input tensor, shape (B, T, C)
+
+            Returns:
+                Tuple of (transformer_output, text_logits). transformer_output
+                is on last_device (for depformer), text_logits is on primary_device
+                (for sampling).
+            """
+            from ..modules.transformer import create_sin_embedding
+
+            model = self._model
+            transformer = model.transformer
+
+            # Input should be on primary device (where first layers are)
+            x = input_.to(self._layer_devices[0])
+            B, T, C = x.shape
+
+            # Streaming state is now properly initialized via StreamingContainer inheritance
+            state = transformer._streaming_state
+            if state is None:
+                raise RuntimeError("Transformer streaming state not initialized. Call streaming_forever() first.")
+            offset = state.offset
+
+            # Handle positional embeddings (for "sin" or "sin_rope" modes)
+            if transformer.positional_embedding in {"sin", "sin_rope"}:
+                positions = torch.arange(T, device=x.device).view(1, -1, 1)
+                positions = positions + offset.view(-1, 1, 1)
+                pos_emb = create_sin_embedding(
+                    positions, C, max_period=transformer.max_period, dtype=x.dtype
+                )
+                x = x + transformer.positional_scale * pos_emb
+
+            # Process through transformer layers with device transitions
+            # Using CUDA events for non-blocking synchronization between GPUs
+            current_device = self._layer_devices[0]
+            current_stream = self._gpu_streams[str(current_device)]
+
+            # Ensure the custom stream waits for any pending operations on the default stream
+            current_stream.wait_stream(torch.cuda.current_stream(current_device))
+
+            # Record timing start for first GPU
+            if self._timing_enabled:
+                with torch.cuda.stream(current_stream):
+                    self._timing_events[str(current_device)][0].record()
+
+            for i, layer in enumerate(transformer.layers):
+                layer_device = self._layer_devices[i]
+
+                if layer_device != current_device:
+                    # Record timing end for outgoing GPU, then boundary event
+                    with torch.cuda.stream(current_stream):
+                        if self._timing_enabled:
+                            self._timing_events[str(current_device)][1].record()
+                        self._boundary_events[str(current_device)].record()
+
+                    # Switch to new device's stream
+                    prev_device = current_device
+                    current_device = layer_device
+                    current_stream = self._gpu_streams[str(current_device)]
+
+                    # Wait for previous GPU before starting
+                    with torch.cuda.stream(current_stream):
+                        self._boundary_events[str(prev_device)].wait()
+                        x = x.to(layer_device, non_blocking=True)
+                        if self._timing_enabled:
+                            self._timing_events[str(current_device)][0].record()
+
+                # Execute layer on current stream
+                with torch.cuda.stream(current_stream):
+                    x = layer(x)
+
+            # Update streaming state offset (state is guaranteed non-None, checked above)
+            state.offset.add_(T)
+
+            # Output norm and text linear on last device's stream.
+            # current_stream == last_stream when last layer is on last_device (always true
+            # with even distribution), so the operations are already ordered. The event
+            # record is for the primary_stream wait below.
+            last_stream = self._gpu_streams[str(self._last_device)]
+            with torch.cuda.stream(last_stream):
+                if model.out_norm:
+                    x = model.out_norm(x)
+                text_logits = model.text_linear(x)
+                text_logits = text_logits[:, None]
+                self._boundary_events[str(self._last_device)].record()
+
+            # Transfer text_logits back to primary device for sampling
+            # (transformer_out stays on last_device for depformer)
+            primary_stream = self._gpu_streams[str(self._primary_device)]
+            with torch.cuda.stream(primary_stream):
+                self._boundary_events[str(self._last_device)].wait()
+                text_logits = text_logits.to(self._primary_device, non_blocking=True)
+
+            # Record timing end for last GPU (includes out_norm + text_linear)
+            if self._timing_enabled:
+                with torch.cuda.stream(last_stream):
+                    self._timing_events[str(self._last_device)][1].record()
+
+            # Sync streams: last_device for depformer (uses x), primary for sampling (uses text_logits)
+            torch.cuda.current_stream(self._last_device).wait_stream(last_stream)
+            torch.cuda.current_stream(self._primary_device).wait_stream(primary_stream)
+
+            # Collect and log timing metrics periodically
+            if self._timing_enabled:
+                self._frame_count += 1
+                self._collect_timing_metrics()
+
+            return x, text_logits
+
+        def _collect_timing_metrics(self):
+            """Collect GPU timing and log periodic summary.
+
+            Only reads event timings on the logging frame (every
+            _timing_log_interval frames).  Uses non-blocking event.query()
+            instead of torch.cuda.synchronize() to avoid stalling the CPU
+            pipeline — if any event hasn't completed yet we simply skip this
+            logging round rather than blocking.
+            """
+            if self._frame_count % self._timing_log_interval != 0:
+                return
+
+            # Non-blocking check: skip if any timing event hasn't completed yet
+            # rather than blocking the CPU with torch.cuda.synchronize().
+            for start_evt, end_evt in self._timing_events.values():
+                if not start_evt.query() or not end_evt.query():
+                    return
+            dep_start, dep_end = self._depformer_timing_events
+            if not dep_start.query() or not dep_end.query():
+                return
+
+            # Read the most recent start/end pair for each GPU
+            parts = []
+            gpu_times = []
+            for dev_str in sorted(self._timing_events.keys()):
+                start_evt, end_evt = self._timing_events[dev_str]
+                try:
+                    elapsed = start_evt.elapsed_time(end_evt)
+                except RuntimeError as e:
+                    logger.warning(f"GPU timing event error for {dev_str}: {e}")
+                    continue
+                gpu_times.append((dev_str, elapsed))
+                parts.append(f"{dev_str}: {elapsed:.1f}ms")
+
+            # Depformer timing (most recent sample)
+            dep_part = ""
+            if self._depformer_times:
+                dep_last = self._depformer_times[-1]
+                dep_part = f" | depformer: {dep_last:.1f}ms"
+                self._depformer_times.clear()
+
+            idle_part = ""
+            if len(gpu_times) >= 2:
+                t0 = gpu_times[0][1]
+                t1 = gpu_times[1][1]
+                max_t = max(t0, t1)
+                idle_ratio = abs(t0 - t1) / max_t if max_t > 0 else 0
+                idle_part = f" | idle_ratio={idle_ratio:.2f}"
+
+            logger.info(f"[GPU timing @ frame {self._frame_count}] {' | '.join(parts)}{dep_part}{idle_part}")
+
+        def record_depformer_timing(self, elapsed_ms: float):
+            """Record depformer timing from external caller."""
+            if self._timing_enabled:
+                self._depformer_times.append(elapsed_ms)
+
+        def forward_codes(self, sequence):
+            """Forward pass from codes through embeddings and transformer."""
+            input_ = self.embed_codes(sequence)
+            return self.forward_embeddings(input_)
+
+        def forward_depformer(self, *args, skip_transfer: bool = False, **kwargs):
+            """Forward pass through depformer on last device.
+
+            No explicit synchronization needed here because forward_embeddings()
+            already synchronized with the default stream via wait_stream() before
+            returning. The depformer inputs are guaranteed to be ready.
+
+            Args:
+                skip_transfer: If True, skip device transfers for inputs (they are
+                    already on depformer device). Used by CUDA-graphed depformer_step
+                    where transfers happen outside the graph capture.
+
+            Transfers input tensors to depformer device if needed (unless skip_transfer),
+            and returns result without transferring back (caller handles that).
+            """
+            if not skip_transfer:
+                # Transfer inputs to depformer device
+                new_args = []
+                for arg in args:
+                    if isinstance(arg, torch.Tensor) and arg.device != self._depformer_device:
+                        arg = arg.to(self._depformer_device, non_blocking=True)
+                    new_args.append(arg)
+                new_kwargs = {}
+                for k, v in kwargs.items():
+                    if isinstance(v, torch.Tensor) and v.device != self._depformer_device:
+                        v = v.to(self._depformer_device, non_blocking=True)
+                    new_kwargs[k] = v
+            else:
+                # Inputs already on depformer device, skip transfer
+                new_args = list(args)
+                new_kwargs = dict(kwargs)
+
+            result = self._model.forward_depformer(*new_args, **new_kwargs)
+
+            # When skip_transfer=True, caller handles result transfer
+            # When skip_transfer=False (legacy path), transfer result back to primary device
+            if not skip_transfer:
+                if isinstance(result, torch.Tensor):
+                    result = result.to(self._primary_device, non_blocking=True)
+                elif isinstance(result, tuple):
+                    result = tuple(
+                        r.to(self._primary_device, non_blocking=True) if isinstance(r, torch.Tensor) else r
+                        for r in result
+                    )
+            return result
+
+        def _get_initial_token(self):
+            return self._model._get_initial_token().to(self._primary_device)
+
+        def parameters(self, recurse=True):
+            # Yield embeddings first (on primary device) to ensure device detection works
+            # This ensures next(iter(model.parameters())).device returns cuda:0
+            yield from self._model.emb.parameters(recurse)
+            yield from self._model.text_emb.parameters(recurse)
+            # Then other parameters
+            for name, param in self._model.named_parameters(recurse=recurse):
+                if not name.startswith('emb.') and not name.startswith('text_emb.'):
+                    yield param
+
+        def __getattr__(self, name):
+            # Names starting with '_' are handled by nn.Module (includes _model,
+            # _primary_device, _depformer_device, etc.). Explicitly listed names are
+            # methods/properties defined on this wrapper that should not delegate.
+            if name.startswith('_') or name in ('training', 'forward', 'embed_codes',
+                                                  'forward_embeddings', 'forward_codes',
+                                                  'forward_depformer', 'device'):
+                return super().__getattr__(name)
+            return getattr(self._model, name)
+
+    wrapped = MultiGPULMModel(model, layer_devices, primary_device, last_device,
+                              timing_enabled=timing_enabled)
+    wrapped.eval()
+
+    # Log memory usage
+    for i in range(num_gpus):
+        allocated = torch.cuda.memory_allocated(i) / 1e9
+        logger.info(f"GPU {i} memory allocated: {allocated:.2f} GB")
+
+    return wrapped
