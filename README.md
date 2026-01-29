@@ -5,6 +5,8 @@
 [![Demo](https://img.shields.io/badge/🎮-Demo-green)](https://research.nvidia.com/labs/adlr/personaplex/)
 [![Discord](https://img.shields.io/badge/Discord-Join-purple?logo=discord)](https://discord.gg/5jAXrrbwRb)
 
+> **Fork Notice:** This is a proof-of-concept fork adding multi-GPU support for distributing model layers across multiple GPUs. See the [Multi-GPU](#multi-gpu) section below.
+
 PersonaPlex is a real-time, full-duplex speech-to-speech conversational model that enables persona control through text-based role prompts and audio-based voice conditioning. Trained on a combination of synthetic and real conversations, it produces natural, low-latency spoken interactions with a consistent persona. PersonaPlex is based on the [Moshi](https://arxiv.org/abs/2410.00037) architecture and weights.
 
 <p align="center">
@@ -61,9 +63,30 @@ SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR"
 SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --cpu-offload
 ```
 
+#### Multi-GPU
+
+Distribute model layers across multiple GPUs with the `--multi-gpu` flag:
+```bash
+# Multi-GPU (all available GPUs)
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --multi-gpu
+
+# Multi-GPU limited to 2 GPUs
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --multi-gpu --gpus 2
+
+# Multi-GPU with custom cost ratio and timing
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --multi-gpu --depformer-cost-ratio 0.75 --timing
+```
+
+| Flag | Description |
+|------|-------------|
+| `--multi-gpu` | Distribute layers across all available GPUs |
+| `--gpus N` | Limit the number of GPUs to use |
+| `--depformer-cost-ratio F` | Control layer balancing between the main transformer and depformer (default `0.5`) |
+| `--timing` | Enable per-GPU timing metrics |
+
 Access the Web UI from a browser at `localhost:8998` if running locally, otherwise look for the access link printed by the script:
 ```
-Access the Web UI directly at https://11.54.401.33:8998
+Access the Web UI directly at https://127.0.0.1:8998
 ```
 
 ### Offline Evaluation
